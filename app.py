@@ -360,6 +360,85 @@ def solve_modal_turnstile(page, timeout=90):
     log("❌ Turnstile 验证超时。")
     return False
 
+def dismiss_cookie_banner(page):
+    """关闭或隐藏 Cookie 同意横幅，避免它遮挡续期弹窗里的操作按钮。"""
+    try:
+        banner = page.locator('#ncmp__tool')
+        if banner.count() == 0:
+            return False
+
+        for text in ('Accept All', 'Accept', 'Allow All', 'I Agree', 'Agree', 'Got it', '接受', '同意', '全部接受'):
+            button = page.locator(
+                f'#ncmp__tool button:has-text("{text}"), #ncmp__tool a:has-text("{text}")'
+            ).first
+            try:
+                if button.count() > 0 and button.is_visible():
+                    button.click(timeout=3000)
+                    time.sleep(1)
+                    break
+            except Exception:
+                continue
+
+        # 外层 #ncmp__tool 可能是零尺寸容器，真正的横幅在内层，因此不能只依赖 is_visible()。
+        banner.evaluate(
+            """
+            (el) => {
+                el.style.setProperty('display', 'none', 'important');
+                el.style.setProperty('visibility', 'hidden', 'important');
+                el.style.setProperty('pointer-events', 'none', 'important');
+                el.style.setProperty('z-index', '-1', 'important');
+                el.setAttribute('aria-hidden', 'true');
+                el.querySelectorAll('*').forEach((child) => {
+                    child.style.setProperty('display', 'none', 'important');
+                    child.style.setProperty('pointer-events', 'none', 'important');
+                });
+            }
+            """
+        )
+        page.evaluate(
+            """
+            () => {
+                const selectors = ['.ncmp__banner-inner', '[class*="cookie"][class*="banner"]'];
+                for (const selector of selectors) {
+                    document.querySelectorAll(selector).forEach((el) => {
+                        el.style.setProperty('display', 'none', 'important');
+                        el.style.setProperty('pointer-events', 'none', 'important');
+                    });
+                }
+            }
+            """
+        )
+        log("🍪 已关闭/隐藏 Cookie 同意横幅")
+        return True
+    except Exception as e:
+        log(f"⚠️ 处理 Cookie 横幅失败: {e}")
+        return False
+
+def click_element(page, locator, label, timeout=15000):
+    """点击前先处理 Cookie 横幅；若仍被遮挡，用 DOM click 绕过坐标命中检查。"""
+    dismiss_cookie_banner(page)
+    try:
+        locator.click(timeout=timeout)
+        return True
+    except Exception as e:
+        log(f"⚠️ {label} 常规点击失败，尝试强制点击: {e}")
+
+    dismiss_cookie_banner(page)
+    try:
+        locator.evaluate(
+            """
+            (el) => {
+                el.scrollIntoView({ block: 'center', inline: 'center' });
+                el.click();
+            }
+            """
+        )
+        log(f"✅ {label} 已通过 DOM click 完成")
+        return True
+    except Exception as e:
+        log(f"❌ {label} DOM click 仍失败: {e}")
+        raise
+
 def open_browser(p):
     """启动浏览器，返回 (browser, page)。优先 patchright（反检测内核），未安装则退回原生 playwright。"""
     proxy_arg = {"server": PROXY_SERVER} if IS_PROXY else None
@@ -555,17 +634,19 @@ def renew_service(page):
         if page.url != SERVICE_URL:
             page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
         handle_cloudflare(page)
+        dismiss_cookie_banner(page)
         time.sleep(12) # 等待续期页面完全加载,未完全加载无法点击
         log("🖱️ 准备点击 Renew 按钮...")
         renew_btn = page.locator('button:has-text("Renew")')
         create_btn = page.locator('button:has-text("Create Invoice")')
+        dismiss_cookie_banner(page)
         modal_opened = False
         for i in range(6):
             try:
                 renew_btn.wait_for(state="visible", timeout=10000)
                 renew_btn.scroll_into_view_if_needed()
                 log(f"🖱️ 第 {i+1} 次尝试点击 Renew...")
-                renew_btn.click()
+                click_element(page, renew_btn, 'Renew 按钮', timeout=10000)
                 time.sleep(3) # 等待一小段时间，检测是否出现“未到续期时间”弹窗
                 page_text = page.locator("body").inner_text()
                 if "Renewal Restricted" in page_text or "can only renew" in page_text.lower():
@@ -596,6 +677,8 @@ def renew_service(page):
             log("⚠️ Turnstile 未确认通过，仍将尝试提交...")
             page.screenshot(path="turnstile_timeout.png")
 
+        dismiss_cookie_banner(page)
+
         # 点击 Create Invoice；未跳转说明验证未通过/已过期，重做验证后再试
         new_invoice_url = None
         time.sleep(2)
@@ -603,7 +686,7 @@ def renew_service(page):
             log(f"🖱️ 点击 Create Invoice（第 {attempt + 1} 次）...")
             try:
                 create_btn.wait_for(state="visible", timeout=30000)
-                create_btn.click(timeout=20000)
+                click_element(page, create_btn, 'Create Invoice 按钮', timeout=10000)
             except Exception as e:
                 log(f"⚠️ 点击 Create Invoice 失败: {e}")
                 solve_modal_turnstile(page, timeout=45)
@@ -639,7 +722,7 @@ def renew_service(page):
         log("🔎 查找 Pay 按钮...")
         pay_btn = page.locator('a:has-text("Pay"):visible, button:has-text("Pay"):visible').first
         pay_btn.wait_for(state="visible", timeout=30000)
-        pay_btn.click()
+        click_element(page, pay_btn, 'Pay 按钮', timeout=15000)
         log("✅ Pay 按钮已点击")
         time.sleep(6) # 等待支付确认页面或跳转回服务页
         page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000) # 返回服务管理页面以获取新的到期时间
